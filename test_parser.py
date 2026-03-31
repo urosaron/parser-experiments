@@ -1,4 +1,6 @@
 import json
+import re
+
 import ollama
 
 # ── Swap this to change the model ─────────────────────────────────────────────
@@ -16,7 +18,7 @@ Rules:
 - Use the scene graph to resolve object references. Match by metadata.label, metadata.type, material colour, or world position.
 - All object IDs in the scene graph are server-assigned strings (e.g. "server_abc123"). Use these exactly as-is in your output.
 - If the target object cannot be resolved, set "id" to null and include "target_description" with the user's phrasing.
-- For spawn commands, set "id" to null. Set "asset_query" to a natural language description of the object the user wants — this will be resolved by the asset retrieval system downstream.
+- For spawn commands, set "id" to null. Set "asset_query" to a short, concise description of the object type only (2–5 words: material + style + object type). Do not include position, placement, or scene context — "near the window", "for the corner", "by the door" must be omitted. Examples: "wooden chair", "glass coffee table", "tall floor lamp".
 - For edit/move commands, infer whether the position is relative or absolute from the user's phrasing. Use the appropriate position format.
 - All positions are in world space (absolute x/y/z). For relative moves, express the intended delta as a direction and unit count.
 - Rotation is in Euler degrees. Scaling is a uniform or per-axis multiplier.
@@ -139,6 +141,7 @@ def build_user_message(transcript: str, user_context: dict, scene: list) -> str:
 
 
 def parse_command(transcript: str, user_context: dict, scene: list) -> str:
+    """Call the LLM parser and return the raw response string."""
     user_message = build_user_message(transcript, user_context, scene)
     response = ollama.chat(
         model=MODEL_NAME,
@@ -151,6 +154,70 @@ def parse_command(transcript: str, user_context: dict, scene: list) -> str:
     return response["message"]["content"]
 
 
+def _strip_markdown_fence(text: str) -> str:
+    """Remove optional ```json … ``` wrapper that some models add."""
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    return match.group(1).strip() if match else text.strip()
+
+
+def parse_and_resolve(
+    transcript: str,
+    user_context: dict,
+    scene: list,
+    resolver=None,
+) -> dict:
+    """
+    Full pipeline: LLM parse → RAG resolve (spawn only) → final command dict.
+
+    Args:
+        transcript:   Raw voice transcript.
+        user_context: User position / look direction / point_target.
+        scene:        Filtered list of nearby scene objects from the server.
+        resolver:     Optional AssetResolver instance. If None and the command
+                      is a spawn, a fresh resolver is created automatically.
+                      Pass an existing instance to avoid reloading the index on
+                      every call (recommended in production).
+
+    Returns:
+        Parsed command dict. Spawn commands have asset_query replaced by
+        asset_url on success, or an asset_error field on failure.
+    """
+    raw = parse_command(transcript, user_context, scene)
+    cleaned = _strip_markdown_fence(raw)
+
+    try:
+        command = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        return {"command": "error", "error": f"invalid_json: {exc}", "raw": raw}
+
+    if command.get("command") != "spawn":
+        return command
+
+    asset_query = command.get("asset_query", "")
+    if not asset_query:
+        return command
+
+    # Lazy-load the resolver only when needed
+    if resolver is None:
+        try:
+            from rag.query import AssetResolver
+            resolver = AssetResolver()
+        except Exception as exc:
+            command["asset_error"] = f"resolver_unavailable: {exc}"
+            return command
+
+    url, score, matched_name = resolver.resolve(asset_query)
+
+    if url is None:
+        command["asset_error"] = f"no_match (best: '{matched_name}', score: {score:.3f})"
+    else:
+        command.pop("asset_query", None)
+        command["asset_url"] = url
+        command["asset_match_score"] = round(score, 3)
+
+    return command
+
+
 if __name__ == "__main__":
     print(f"Model     : {MODEL_NAME}")
     print(f"Transcript: {TEST_TRANSCRIPT}")
@@ -161,7 +228,7 @@ if __name__ == "__main__":
     print(result)
     print("\n--- Parsed ---")
     try:
-        parsed = json.loads(result)
+        parsed = json.loads(_strip_markdown_fence(result))
         print(json.dumps(parsed, indent=2))
     except json.JSONDecodeError as e:
         print(f"[INVALID JSON] {e}")
